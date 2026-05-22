@@ -1,4 +1,4 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, useNavigate, Link } from "@tanstack/react-router";
 import { motion } from "framer-motion";
 import { useState, useEffect } from "react";
 import { Building2, Loader2, Mail, Lock, ArrowRight, ShieldCheck, TrendingUp, Sparkles } from "lucide-react";
@@ -207,6 +207,15 @@ function LoginPage() {
                   )}
                 </Button>
               </form>
+
+              <div className="mt-4 text-right">
+                <Link
+                  to="/forgot-password"
+                  className="text-xs text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  Esqueci minha senha
+                </Link>
+              </div>
 
               <div className="flex items-center gap-2 mt-8 pt-6 border-t border-border/60 text-xs text-muted-foreground">
                 <ShieldCheck className="w-3.5 h-3.5" />
