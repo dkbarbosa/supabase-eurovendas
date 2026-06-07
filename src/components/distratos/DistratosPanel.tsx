@@ -1,0 +1,702 @@
+import { useMemo, useState } from "react";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useServerFn } from "@tanstack/react-start";
+import { listDistratos, markDistratoDevolvido, cancelDistrato, createDistrato, listSalesForDistrato, deleteDistrato, listDescontosByDistrato, estornarDescontoDistrato } from "@/lib/distratos.functions";
+import { useAuth } from "@/lib/auth";
+import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription } from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
+import { Loader2, Ban, CheckCircle2, Trash2, Search, AlertTriangle, Plus, RotateCcw } from "lucide-react";
+import { toast } from "sonner";
+import { motion } from "framer-motion";
+
+const BRL = (n: number | null | undefined) =>
+  (Number(n) || 0).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+
+export function DistratosPanel() {
+  const qc = useQueryClient();
+  const { isAdmin, isFinanceiro } = useAuth();
+  const isStaff = isAdmin || isFinanceiro;
+
+  const fnList = useServerFn(listDistratos);
+  const fnMark = useServerFn(markDistratoDevolvido);
+  const fnCancel = useServerFn(cancelDistrato);
+  const fnDelete = useServerFn(deleteDistrato);
+
+  const [status, setStatus] = useState<"todos" | "pendente_devolucao" | "devolvido" | "cancelado">("todos");
+  const [corretorFilter, setCorretorFilter] = useState<string>("todos");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [search, setSearch] = useState("");
+
+  const { data: rows = [], isLoading } = useQuery({
+    queryKey: ["distratos", status, corretorFilter, from, to],
+    queryFn: () =>
+      fnList({
+        data: {
+          status: status === "todos" ? undefined : status,
+          corretor_user_id: corretorFilter === "todos" ? undefined : corretorFilter,
+          from: from ? new Date(from + "T00:00:00").toISOString() : undefined,
+          to: to ? new Date(to + "T23:59:59").toISOString() : undefined,
+        },
+      }),
+    refetchInterval: 45_000,
+    refetchOnWindowFocus: true,
+  });
+
+  const filtered = useMemo(() => {
+    if (!search.trim()) return rows;
+    const q = search.toLowerCase();
+    return rows.filter((r) =>
+      [r.comprador, r.empreendimento, r.unidade, r.corretor_nome, r.corretor_profile?.display_name, r.corretor_profile?.email]
+        .some((v) => v?.toLowerCase().includes(q)),
+    );
+  }, [rows, search]);
+
+  const corretores = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const r of rows) {
+      if (r.corretor_user_id) {
+        map.set(r.corretor_user_id, r.corretor_profile?.display_name ?? r.corretor_nome ?? r.corretor_profile?.email ?? "—");
+      }
+    }
+    return Array.from(map.entries()).sort((a, b) => a[1].localeCompare(b[1]));
+  }, [rows]);
+
+  const totals = useMemo(() => {
+    const saldo = (r: typeof filtered[number]) =>
+      Math.max(0, Number(r.valor_devolver) - Number((r as { valor_devolvido?: number }).valor_devolvido ?? 0));
+    return {
+      qtdTotal: filtered.length,
+      totalDevolver: filtered.reduce((s, r) => s + (Number(r.valor_devolver) || 0), 0),
+      saldoRestante: filtered.reduce((s, r) => s + saldo(r), 0),
+      devolvido: filtered.reduce((s, r) => s + Number((r as { valor_devolvido?: number }).valor_devolvido ?? 0), 0),
+    };
+  }, [filtered]);
+
+  const [markDlg, setMarkDlg] = useState<{ open: boolean; id: string | null; saldo: number; valor: string; text: string }>({ open: false, id: null, saldo: 0, valor: "", text: "" });
+
+  const markMut = useMutation({
+    mutationFn: (v: { id: string; valor?: number; observacao_recebimento?: string }) => fnMark({ data: v }),
+    onSuccess: () => {
+      toast.success("Devolução registrada.");
+      qc.invalidateQueries({ queryKey: ["distratos"] });
+      setMarkDlg({ open: false, id: null, saldo: 0, valor: "", text: "" });
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+  const cancelMut = useMutation({
+    mutationFn: (id: string) => fnCancel({ data: { id } }),
+    onSuccess: () => { toast.success("Distrato cancelado."); qc.invalidateQueries({ queryKey: ["distratos"] }); qc.invalidateQueries({ queryKey: ["all-requests"] }); },
+    onError: (e: Error) => toast.error(e.message),
+  });
+  const deleteMut = useMutation({
+    mutationFn: (id: string) => fnDelete({ data: { id } }),
+    onSuccess: () => {
+      toast.success("Distrato apagado. Dados revertidos.");
+      qc.invalidateQueries({ queryKey: ["distratos"] });
+      qc.invalidateQueries({ queryKey: ["all-requests"] });
+      qc.invalidateQueries({ queryKey: ["sales-for-distrato"] });
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  return (
+    <div className="space-y-4">
+      {/* Header + ação */}
+      {isStaff && (
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <div className="text-xs text-muted-foreground">Gestão de distratos — selecione qualquer venda para registrar.</div>
+          <NewDistratoDialog onCreated={() => qc.invalidateQueries({ queryKey: ["distratos"] })} />
+        </div>
+      )}
+
+      {/* KPIs */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <KpiTile label="Distratos" value={String(totals.qtdTotal)} sub="No recorte atual" />
+        <KpiTile label="Total a devolver" value={BRL(totals.totalDevolver)} sub="Soma de todos" highlight />
+        <KpiTile label="Saldo a recuperar" value={BRL(totals.saldoRestante)} sub="Pendente (dinheiro + desconto)" />
+        <KpiTile label="Devolvido" value={BRL(totals.devolvido)} sub="Já recuperado" success />
+      </div>
+
+      {/* Filtros */}
+      {isStaff && (
+        <div className="glass-card p-3 flex flex-wrap items-end gap-3">
+          <div className="space-y-1">
+            <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">Status</Label>
+            <Select value={status} onValueChange={(v) => setStatus(v as typeof status)}>
+              <SelectTrigger className="w-44 h-9"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="todos">Todos</SelectItem>
+                <SelectItem value="pendente_devolucao">Pendente devolução</SelectItem>
+                <SelectItem value="devolvido">Devolvido</SelectItem>
+                <SelectItem value="cancelado">Cancelado</SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1">
+            <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">Corretor</Label>
+            <Select value={corretorFilter} onValueChange={setCorretorFilter}>
+              <SelectTrigger className="w-56 h-9"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="todos">Todos os corretores</SelectItem>
+                {corretores.map(([id, nome]) => (
+                  <SelectItem key={id} value={id}>{nome}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          <div className="space-y-1">
+            <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">De</Label>
+            <Input type="date" value={from} onChange={(e) => setFrom(e.target.value)} className="h-9 w-40" />
+          </div>
+          <div className="space-y-1">
+            <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">Até</Label>
+            <Input type="date" value={to} onChange={(e) => setTo(e.target.value)} className="h-9 w-40" />
+          </div>
+          <div className="space-y-1 flex-1 min-w-[200px]">
+            <Label className="text-[10px] uppercase tracking-wider text-muted-foreground">Buscar</Label>
+            <div className="relative">
+              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+              <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Cliente, empreendimento…" className="pl-9 h-9" />
+            </div>
+          </div>
+          {(status !== "todos" || corretorFilter !== "todos" || from || to || search) && (
+            <Button variant="ghost" size="sm" onClick={() => { setStatus("todos"); setCorretorFilter("todos"); setFrom(""); setTo(""); setSearch(""); }}>
+              Limpar
+            </Button>
+          )}
+        </div>
+      )}
+
+      {/* Tabela */}
+      <div className="glass-card p-2 overflow-x-auto">
+        {isLoading && <div className="p-6 text-center"><Loader2 className="w-4 h-4 animate-spin inline" /></div>}
+        {!isLoading && filtered.length === 0 && (
+          <div className="p-8 text-center text-muted-foreground text-sm">Nenhum distrato registrado.</div>
+        )}
+        {!isLoading && filtered.length > 0 && (
+          <table className="w-full text-sm min-w-[1000px]">
+            <thead className="text-[10px] uppercase tracking-wider text-muted-foreground">
+              <tr>
+                <th className="text-left px-3 py-2">Data</th>
+                <th className="text-left px-3 py-2">Cliente</th>
+                <th className="text-left px-3 py-2">Empreend./Un.</th>
+                {isStaff && <th className="text-left px-3 py-2">Corretor</th>}
+                <th className="text-right px-3 py-2">Adiantamento</th>
+                <th className="text-right px-3 py-2">Comissão final</th>
+                <th className="text-right px-3 py-2">A devolver</th>
+                <th className="text-left px-3 py-2">Status</th>
+                <th className="text-left px-3 py-2">Motivo</th>
+                {isStaff && <th className="px-3 py-2 w-1"></th>}
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((r) => {
+                const dev = Number((r as { valor_devolvido?: number }).valor_devolvido ?? 0);
+                const saldo = Math.max(0, Number(r.valor_devolver) - dev);
+                return (
+                <tr key={r.id} className="border-t border-border/40 align-top">
+                  <td className="px-3 py-2 whitespace-nowrap text-xs">{new Date(r.created_at).toLocaleDateString("pt-BR")}</td>
+                  <td className="px-3 py-2 font-medium">{r.comprador ?? "—"}</td>
+                  <td className="px-3 py-2 text-xs text-muted-foreground">{r.empreendimento ?? "—"} / {r.unidade ?? "—"}</td>
+                  {isStaff && (
+                    <td className="px-3 py-2 text-xs">{r.corretor_profile?.display_name ?? r.corretor_nome ?? "—"}</td>
+                  )}
+                  <td className="px-3 py-2 text-right whitespace-nowrap text-xs">{BRL(r.valor_adiantamento)}</td>
+                  <td className="px-3 py-2 text-right whitespace-nowrap text-xs">{BRL(r.valor_comissao_final)}</td>
+                  <td className="px-3 py-2 text-right whitespace-nowrap font-semibold text-destructive">
+                    {BRL(r.valor_devolver)}
+                    {dev > 0 && (
+                      <div className="text-[10px] font-normal text-muted-foreground">
+                        Recuperado: <span className="text-emerald-300">{BRL(dev)}</span>
+                        {saldo > 0 && <> · Saldo: <span className="text-destructive">{BRL(saldo)}</span></>}
+                      </div>
+                    )}
+                    <DescontosInline distratoId={r.id} />
+                    <RecipientsInline recipients={(r as { recipients?: Array<{ id: string; role: string; nome: string | null; valor_devolver: number; valor_devolvido: number; status: string }> }).recipients ?? []} />
+                  </td>
+
+                  <td className="px-3 py-2"><StatusBadge status={r.status} /></td>
+                  <td className="px-3 py-2 max-w-[260px]">
+                    <div className="text-xs">{r.motivo}</div>
+                    {r.observacao_financeiro && <div className="text-xs text-muted-foreground mt-1"><b>F:</b> {r.observacao_financeiro}</div>}
+                    {r.observacao_recebimento && <div className="text-xs text-emerald-400 mt-1"><b>Recebido:</b> {r.observacao_recebimento}</div>}
+                  </td>
+                  {isStaff && (
+                    <td className="px-3 py-2 text-right whitespace-nowrap">
+                      {r.status === "pendente_devolucao" && saldo > 0 && (
+                        <Button size="sm" className="h-7 text-xs" onClick={() => setMarkDlg({ open: true, id: r.id, saldo, valor: "", text: "" })}>
+                          <CheckCircle2 className="w-3 h-3 mr-1" /> Receber em dinheiro
+                        </Button>
+                      )}
+                      {isAdmin && r.status !== "cancelado" && (
+                        <Button size="sm" variant="ghost" className="h-7 text-muted-foreground ml-1"
+                          title="Cancelar (mantém o registro)"
+                          onClick={() => { if (confirm("Cancelar este distrato? Os pedidos voltarão para 'pago'.")) cancelMut.mutate(r.id); }}>
+                          <Ban className="w-3.5 h-3.5" />
+                        </Button>
+                      )}
+                      {(isAdmin || isFinanceiro) && (
+                        <Button size="sm" variant="ghost" className="h-7 text-destructive ml-1"
+                          title="Apagar distrato e reverter dados"
+                          disabled={deleteMut.isPending}
+                          onClick={() => {
+                            if (confirm("Apagar este distrato? A operação some e os valores são zerados (pedidos voltam a 'pago' e o status da venda volta a 'PAGO').")) {
+                              deleteMut.mutate(r.id);
+                            }
+                          }}>
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </Button>
+                      )}
+                    </td>
+                  )}
+                </tr>
+              );})}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {/* Mark devolvido (parcial ou total) */}
+      <Dialog open={markDlg.open} onOpenChange={(o) => setMarkDlg({ ...markDlg, open: o })}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Registrar devolução em dinheiro</DialogTitle>
+            <DialogDescription>
+              Saldo restante: <span className="font-semibold text-destructive">{BRL(markDlg.saldo)}</span>. Deixe em branco para quitar tudo.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="space-y-1.5">
+              <Label>Valor recebido (opcional)</Label>
+              <Input
+                type="number" min={0} step="0.01" max={markDlg.saldo}
+                placeholder={`Máx ${BRL(markDlg.saldo)}`}
+                value={markDlg.valor}
+                onChange={(e) => setMarkDlg({ ...markDlg, valor: e.target.value })}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Observação (opcional)</Label>
+              <Textarea rows={3} value={markDlg.text} onChange={(e) => setMarkDlg({ ...markDlg, text: e.target.value })} maxLength={2000} />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setMarkDlg({ open: false, id: null, saldo: 0, valor: "", text: "" })}>Cancelar</Button>
+            <Button
+              disabled={markMut.isPending}
+              onClick={() => {
+                const v = markDlg.valor ? Number(markDlg.valor) : undefined;
+                if (v !== undefined && (!Number.isFinite(v) || v <= 0)) { toast.error("Valor inválido."); return; }
+                if (v !== undefined && v > markDlg.saldo + 0.001) { toast.error("Valor maior que o saldo."); return; }
+                markMut.mutate({ id: markDlg.id!, valor: v, observacao_recebimento: markDlg.text || undefined });
+              }}>
+              {markMut.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : "Confirmar"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
+  );
+}
+
+function DescontosInline({ distratoId }: { distratoId: string }) {
+  const qc = useQueryClient();
+  const fnList = useServerFn(listDescontosByDistrato);
+  const fnEstornar = useServerFn(estornarDescontoDistrato);
+  const { data: descontos = [] } = useQuery({
+    queryKey: ["distrato-descontos", distratoId],
+    queryFn: () => fnList({ data: { distrato_id: distratoId } }),
+    refetchInterval: 60_000,
+  });
+  const ativos = (descontos as Array<{ id: string; valor_desconto: number; status: string; observacao: string | null }>)
+    .filter((d) => d.status === "aplicado");
+  const estornarMut = useMutation({
+    mutationFn: (id: string) => fnEstornar({ data: { id } }),
+    onSuccess: () => {
+      toast.success("Desconto estornado.");
+      qc.invalidateQueries({ queryKey: ["distrato-descontos", distratoId] });
+      qc.invalidateQueries({ queryKey: ["distratos"] });
+      qc.invalidateQueries({ queryKey: ["all-requests"] });
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+  if (ativos.length === 0) return null;
+  return (
+    <div className="mt-1.5 space-y-1 text-left">
+      {ativos.map((d) => (
+        <div key={d.id} className="flex items-center justify-end gap-1.5 text-[10px] text-violet-300">
+          <RotateCcw className="w-2.5 h-2.5" />
+          <span title={d.observacao ?? undefined}>Desc.: <b>{BRL(d.valor_desconto)}</b></span>
+          <Button
+            size="sm" variant="ghost"
+            className="h-5 px-1 text-[10px] text-muted-foreground hover:text-destructive"
+            disabled={estornarMut.isPending}
+            onClick={() => { if (confirm("Estornar este desconto? Ele volta a compor o saldo a recuperar.")) estornarMut.mutate(d.id); }}
+          >
+            Estornar
+          </Button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+const ROLE_LABEL_INLINE: Record<string, string> = { corretor: "Corretor", gerente: "Gerente", diretor: "Gestão" };
+function RecipientsInline({ recipients }: { recipients: Array<{ id: string; role: string; nome: string | null; valor_devolver: number; valor_devolvido: number; status: string }> }) {
+  if (!recipients || recipients.length === 0) return null;
+  return (
+    <div className="mt-1.5 space-y-0.5 text-left">
+      {recipients.map((r) => {
+        const saldo = Math.max(0, Number(r.valor_devolver) - Number(r.valor_devolvido));
+        const quit = r.status !== "pendente";
+        return (
+          <div key={r.id} className="flex items-center justify-end gap-1.5 text-[10px]">
+            <span className="text-muted-foreground">{ROLE_LABEL_INLINE[r.role] ?? r.role}:</span>
+            <span className={`font-medium ${quit ? "text-emerald-300 line-through" : "text-destructive"}`}>{BRL(r.valor_devolver)}</span>
+            {!quit && saldo < Number(r.valor_devolver) && (
+              <span className="text-muted-foreground">· saldo {BRL(saldo)}</span>
+            )}
+            {quit && <CheckCircle2 className="w-2.5 h-2.5 text-emerald-400" />}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+
+function StatusBadge({ status }: { status: string }) {
+  const map: Record<string, { label: string; cls: string; icon?: React.ReactNode }> = {
+    pendente_devolucao: { label: "Pendente devolução", cls: "bg-amber-500/10 text-amber-400 border-amber-500/30", icon: <AlertTriangle className="w-3 h-3 mr-1" /> },
+    devolvido: { label: "Devolvido", cls: "bg-emerald-500/10 text-emerald-400 border-emerald-500/30", icon: <CheckCircle2 className="w-3 h-3 mr-1" /> },
+    quitado_por_desconto: { label: "Quitado p/ desconto", cls: "bg-violet-500/10 text-violet-300 border-violet-500/30", icon: <RotateCcw className="w-3 h-3 mr-1" /> },
+    cancelado: { label: "Cancelado", cls: "bg-muted text-muted-foreground border-border", icon: <Ban className="w-3 h-3 mr-1" /> },
+  };
+  const it = map[status] ?? { label: status, cls: "bg-muted text-muted-foreground border-border" };
+  return <Badge variant="outline" className={`text-[10px] ${it.cls}`}>{it.icon}{it.label}</Badge>;
+}
+
+function KpiTile({ label, value, sub, highlight, success }: { label: string; value: string; sub: string; highlight?: boolean; success?: boolean }) {
+  return (
+    <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.3 }} className="glass-card p-4">
+      <div className="text-[10px] uppercase tracking-widest text-muted-foreground">{label}</div>
+      <div className={`font-display text-2xl font-semibold tracking-tight mt-1 ${highlight ? "text-destructive" : success ? "text-emerald-400" : ""}`}>{value}</div>
+      <div className="text-[11px] text-muted-foreground mt-1">{sub}</div>
+    </motion.div>
+  );
+}
+
+// ============== NOVO DISTRATO (financeiro) ==============
+type SaleRecipient = {
+  role: "corretor" | "gerente" | "diretor";
+  user_id: string | null;
+  nome: string | null;
+  adiant: number;
+  final: number;
+  total: number;
+};
+type SaleRow = {
+  id: string;
+  data: string | null;
+  comprador: string | null;
+  empreendimento: string | null;
+  unidade: string | null;
+  valor_venda: number | null;
+  corretor: string | null;
+  gerente: string | null;
+  status: string | null;
+  valor_adiantamento_pago: number;
+  valor_comissao_final_pago: number;
+  total_pago: number;
+  ja_distratada: boolean;
+  recipients: SaleRecipient[];
+};
+
+const ROLE_LABEL: Record<string, string> = {
+  corretor: "Corretor",
+  gerente: "Gerente",
+  diretor: "Gestão",
+};
+const ROLE_ACCENT: Record<string, string> = {
+  corretor: "border-sky-500/40 bg-sky-500/5",
+  gerente: "border-violet-500/40 bg-violet-500/5",
+  diretor: "border-amber-500/40 bg-amber-500/5",
+};
+
+type RecipientState = {
+  role: "corretor" | "gerente" | "diretor";
+  user_id: string | null;
+  nome: string | null;
+  total_pago: number;
+  selected: boolean;
+  valor: string;
+};
+
+function NewDistratoDialog({ onCreated }: { onCreated: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState("");
+  const [selected, setSelected] = useState<SaleRow | null>(null);
+  const [recipientsSt, setRecipientsSt] = useState<RecipientState[]>([]);
+  const [motivo, setMotivo] = useState("");
+  const [obs, setObs] = useState("");
+
+  const fnList = useServerFn(listSalesForDistrato);
+  const fnCreate = useServerFn(createDistrato);
+
+  const { data: sales = [], isLoading } = useQuery({
+    queryKey: ["sales-for-distrato"],
+    queryFn: () => fnList(),
+    enabled: open,
+  });
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const rows = sales as SaleRow[];
+    if (!q) return rows.slice(0, 200);
+    return rows
+      .filter((s) =>
+        [s.comprador, s.empreendimento, s.unidade, s.corretor, s.status]
+          .some((v) => v?.toLowerCase().includes(q)),
+      )
+      .slice(0, 200);
+  }, [sales, search]);
+
+  const mut = useMutation({
+    mutationFn: (v: {
+      sale_id: string;
+      motivo: string;
+      observacao_financeiro?: string;
+      recipients: Array<{ role: "corretor" | "gerente" | "diretor"; user_id: string | null; nome: string | null; valor_devolver: number }>;
+    }) => fnCreate({ data: v }),
+    onSuccess: () => {
+      toast.success("Distrato registrado.");
+      onCreated();
+      reset();
+      setOpen(false);
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+
+  const reset = () => {
+    setSelected(null);
+    setRecipientsSt([]);
+    setMotivo("");
+    setObs("");
+    setSearch("");
+  };
+
+  const pickSale = (s: SaleRow) => {
+    setSelected(s);
+    setRecipientsSt(
+      s.recipients.map((r) => ({
+        role: r.role,
+        user_id: r.user_id,
+        nome: r.nome,
+        total_pago: r.total,
+        selected: true,
+        valor: r.total.toFixed(2),
+      })),
+    );
+  };
+
+  const totalSelecionado = recipientsSt
+    .filter((r) => r.selected)
+    .reduce((s, r) => s + (Number(r.valor.replace(",", ".")) || 0), 0);
+
+  const someSelected = recipientsSt.some((r) => r.selected && Number(r.valor.replace(",", ".")) > 0);
+  const canSubmit = !!selected && motivo.trim().length >= 3 && someSelected;
+
+  return (
+    <>
+      <Button variant="destructive" size="sm" onClick={() => setOpen(true)}>
+        <Plus className="w-3.5 h-3.5 mr-1" /> Novo distrato
+      </Button>
+
+      <Dialog open={open} onOpenChange={(o) => { setOpen(o); if (!o) reset(); }}>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <DialogTitle>Registrar distrato</DialogTitle>
+            <DialogDescription>
+              Selecione a venda e marque, individualmente, quem recebeu e o quanto cada um deve devolver à Euro.
+            </DialogDescription>
+          </DialogHeader>
+
+          {!selected && (
+            <div className="space-y-3">
+              <div className="relative">
+                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+                <Input
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="Buscar por cliente, empreendimento, corretor, status…"
+                  className="pl-9"
+                  autoFocus
+                />
+              </div>
+              <div className="max-h-[420px] overflow-auto rounded-lg border border-border/40">
+                {isLoading && <div className="p-6 text-center"><Loader2 className="w-4 h-4 animate-spin inline" /></div>}
+                {!isLoading && filtered.length === 0 && (
+                  <div className="p-6 text-center text-sm text-muted-foreground">Nenhuma venda encontrada.</div>
+                )}
+                {!isLoading && filtered.length > 0 && (
+                  <table className="w-full text-sm">
+                    <thead className="text-[10px] uppercase tracking-wider text-muted-foreground bg-secondary/30 sticky top-0">
+                      <tr>
+                        <th className="text-left px-3 py-2">Data</th>
+                        <th className="text-left px-3 py-2">Cliente</th>
+                        <th className="text-left px-3 py-2">Empreend./Un.</th>
+                        <th className="text-left px-3 py-2">Corretor</th>
+                        <th className="text-left px-3 py-2">Status</th>
+                        <th className="text-right px-3 py-2">Pago</th>
+                        <th className="px-3 py-2"></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filtered.map((s) => (
+                        <tr key={s.id} className="border-t border-border/40">
+                          <td className="px-3 py-2 text-xs whitespace-nowrap">
+                            {s.data ? new Date(s.data).toLocaleDateString("pt-BR") : "—"}
+                          </td>
+                          <td className="px-3 py-2 font-medium">{s.comprador ?? "—"}</td>
+                          <td className="px-3 py-2 text-xs text-muted-foreground">{s.empreendimento ?? "—"} / {s.unidade ?? "—"}</td>
+                          <td className="px-3 py-2 text-xs">{s.corretor ?? "—"}</td>
+                          <td className="px-3 py-2 text-xs">
+                            <Badge variant="outline" className="text-[10px]">{s.status ?? "—"}</Badge>
+                          </td>
+                          <td className="px-3 py-2 text-right text-xs whitespace-nowrap">{BRL(s.total_pago)}</td>
+                          <td className="px-3 py-2 text-right">
+                            {s.ja_distratada ? (
+                              <Badge variant="outline" className="text-[10px] text-destructive border-destructive/40">Já distratada</Badge>
+                            ) : (
+                              <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => pickSale(s)}>
+                                Selecionar
+                              </Button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          )}
+
+          {selected && (
+            <div className="space-y-4">
+              <div className="rounded-lg border border-destructive/30 bg-destructive/5 p-3">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <div className="text-[10px] uppercase tracking-wider text-muted-foreground">Cliente</div>
+                    <div className="font-medium">{selected.comprador ?? "—"}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {selected.empreendimento ?? "—"} / {selected.unidade ?? "—"} · Corretor: {selected.corretor ?? "—"}
+                    </div>
+                  </div>
+                  <Button variant="ghost" size="sm" onClick={() => { setSelected(null); setRecipientsSt([]); }}>
+                    Trocar venda
+                  </Button>
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <Label>Quem recebeu e deve devolver *</Label>
+                {recipientsSt.length === 0 && (
+                  <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-300">
+                    Esta venda não tem pedidos pagos. Não há valores a recuperar.
+                  </div>
+                )}
+                {recipientsSt.map((r, idx) => (
+                  <div
+                    key={`${r.role}:${r.user_id ?? "x"}`}
+                    className={`rounded-lg border p-3 flex items-center gap-3 ${ROLE_ACCENT[r.role]} ${!r.selected ? "opacity-60" : ""}`}
+                  >
+                    <input
+                      type="checkbox"
+                      className="w-4 h-4 accent-primary"
+                      checked={r.selected}
+                      onChange={(e) => {
+                        const v = e.target.checked;
+                        setRecipientsSt((prev) => prev.map((p, i) => i === idx ? { ...p, selected: v } : p));
+                      }}
+                    />
+                    <div className="flex-1 min-w-0">
+                      <div className="text-xs uppercase tracking-wider text-muted-foreground">{ROLE_LABEL[r.role]}</div>
+                      <div className="font-medium truncate">{r.nome ?? "—"}</div>
+                      <div className="text-[11px] text-muted-foreground">Recebeu: <b>{BRL(r.total_pago)}</b></div>
+                    </div>
+                    <div className="w-40 space-y-1">
+                      <Label className="text-[10px] uppercase text-muted-foreground">A devolver</Label>
+                      <Input
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        disabled={!r.selected}
+                        value={r.valor}
+                        onChange={(e) =>
+                          setRecipientsSt((prev) => prev.map((p, i) => i === idx ? { ...p, valor: e.target.value } : p))
+                        }
+                        className="h-9 text-right font-semibold"
+                      />
+                    </div>
+                  </div>
+                ))}
+                {recipientsSt.length > 0 && (
+                  <div className="flex items-center justify-between rounded-lg border border-border/60 bg-secondary/30 p-2.5">
+                    <span className="text-xs text-muted-foreground">Total a devolver à Euro</span>
+                    <span className="font-display text-xl font-semibold text-destructive">{BRL(totalSelecionado)}</span>
+                  </div>
+                )}
+              </div>
+
+              <div className="space-y-1.5">
+                <Label>Motivo do distrato *</Label>
+                <Textarea value={motivo} onChange={(e) => setMotivo(e.target.value)} rows={3} maxLength={2000} placeholder="Descreva o motivo do distrato" />
+              </div>
+              <div className="space-y-1.5">
+                <Label>Observação (opcional)</Label>
+                <Textarea value={obs} onChange={(e) => setObs(e.target.value)} rows={2} maxLength={2000} />
+              </div>
+            </div>
+          )}
+
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => { setOpen(false); reset(); }}>Cancelar</Button>
+            {selected && (
+              <Button
+                variant="destructive"
+                disabled={!canSubmit || mut.isPending}
+                onClick={() => {
+                  const recipients = recipientsSt
+                    .filter((r) => r.selected)
+                    .map((r) => ({
+                      role: r.role,
+                      user_id: r.user_id,
+                      nome: r.nome,
+                      valor_devolver: Number(r.valor.replace(",", ".")) || 0,
+                    }))
+                    .filter((r) => r.valor_devolver > 0);
+                  if (recipients.length === 0) { toast.error("Selecione ao menos 1 beneficiário com valor > 0."); return; }
+                  mut.mutate({
+                    sale_id: selected.id,
+                    motivo,
+                    observacao_financeiro: obs || undefined,
+                    recipients,
+                  });
+                }}
+              >
+                {mut.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : `Confirmar distrato (${BRL(totalSelecionado)})`}
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </>
+  );
+}
